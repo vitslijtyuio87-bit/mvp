@@ -1,0 +1,531 @@
+import copy
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sys
+import tempfile
+import time
+import unicodedata
+import warnings
+from contextlib import contextmanager
+from pathlib import Path
+
+if sys.version_info < (3, 10):
+    raise SystemExit("Потрібен Python 3.10 або новіший.")
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+BASE_DIR = (
+    Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AuthSystem"
+    if os.name == "nt"
+    else Path.home() / ".local" / "share" / "auth_system"
+)
+
+DB_FILE = BASE_DIR / "users_db.json"
+LOCK_FILE = BASE_DIR / "users_db.lock"
+MAX_ATTEMPTS = 5
+BASE_LOCK_SECONDS = 60
+MIN_PASSWORD_LEN = 12
+MAX_USERS = 10_000
+LOGIN_RE = re.compile(r"^[a-z0-9_]{3,32}$")
+SCRYPT_PARAMS = {
+    "n": 2**17,
+    "r": 8,
+    "p": 1,
+    "dklen": 32,
+    "maxmem": 256 * 1024 * 1024,
+}
+LEGACY_SCRYPT_PARAMS = {"n": 2**14, "r": 8, "p": 1, "dklen": 32}
+ALLOWED_PARAMS = {(2**14, 8, 1, 32), (2**17, 8, 1, 32)}
+COMMON_PASSWORDS = {"passwordpassword", "111111111111", "123456789012", "qwertyuiop12"}
+QUESTIONS = (
+    ("mother_maiden_name", "Дівоче прізвище матері?"),
+    ("first_pet_name", "Ім'я першого домашнього улюбленця?"),
+    ("birth_city", "Місто, де ви народилися?"),
+    ("first_school", "Назва вашої першої школи?"),
+)
+QUESTION_BY_ID = dict(QUESTIONS)
+GENERIC_FAIL = "Не вдалося виконати автентифікацію."
+
+
+def init_storage() -> None:
+    BASE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        os.chmod(BASE_DIR, 0o700)
+
+
+def normalize_secret(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = text.replace("’", "'").replace("ʼ", "'").replace("`", "'")
+    return " ".join(text.split())
+
+
+def normalize_password(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
+
+
+def secure_getpass(prompt: str) -> str:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("Потрібен справжній термінал для прихованого введення секретів.")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning as error:
+            raise RuntimeError("Не вдалося приховати введення секрету.") from error
+
+
+def _params_for(record: dict) -> dict:
+    params = record.get("params", LEGACY_SCRYPT_PARAMS)
+    if not isinstance(params, dict):
+        raise ValueError("invalid scrypt parameters")
+    key = tuple(params.get(name) for name in ("n", "r", "p", "dklen"))
+    if key not in ALLOWED_PARAMS:
+        raise ValueError("invalid scrypt parameters")
+    n, r, p, dklen = key
+    return {
+        "n": n,
+        "r": r,
+        "p": p,
+        "dklen": dklen,
+        "maxmem": SCRYPT_PARAMS["maxmem"],
+    }
+
+
+def hash_secret(secret: str, salt: bytes, params: dict) -> bytes:
+    return hashlib.scrypt(secret.encode("utf-8"), salt=salt, **params)
+
+
+def make_record(secret: str) -> dict:
+    salt = secrets.token_bytes(16)
+    return {
+        "salt": salt.hex(),
+        "hash": hash_secret(secret, salt, SCRYPT_PARAMS).hex(),
+        "params": SCRYPT_PARAMS.copy(),
+    }
+
+
+def check_record(secret: str, record: object) -> bool:
+    try:
+        if not isinstance(record, dict):
+            return False
+        salt = bytes.fromhex(record["salt"])
+        expected = bytes.fromhex(record["hash"])
+        actual = hash_secret(secret, salt, _params_for(record))
+        return hmac.compare_digest(actual, expected)
+    except (KeyError, TypeError, ValueError, OverflowError, MemoryError):
+        return False
+
+
+def _needs_rehash(record: object) -> bool:
+    if not isinstance(record, dict):
+        return True
+    params = record.get("params", LEGACY_SCRYPT_PARAMS)
+    if not isinstance(params, dict):
+        return True
+    return tuple(params.get(name) for name in ("n", "r", "p", "dklen")) != tuple(
+        SCRYPT_PARAMS[name] for name in ("n", "r", "p", "dklen")
+    )
+
+
+_dummy_started = time.monotonic()
+_DUMMY_RECORD = make_record("dummy")
+MIN_LOGIN_SECONDS = max(2.0, 7 * (time.monotonic() - _dummy_started))
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return result if result >= 0 else default
+
+
+def answer_records(user: object) -> dict:
+    if not isinstance(user, dict) or not isinstance(user.get("answers"), list):
+        return {}
+    result = {}
+    for index, item in enumerate(user["answers"]):
+        if (
+            isinstance(item, dict)
+            and isinstance(item.get("question_id"), str)
+            and "record" in item
+        ):
+            question_id = item["question_id"]
+            record = item["record"]
+        elif index < len(QUESTIONS):
+            question_id = QUESTIONS[index][0]
+            record = item
+        else:
+            continue
+        if question_id in QUESTION_BY_ID and question_id not in result:
+            result[question_id] = record
+    return result
+
+
+def _validate_db(db: object) -> dict:
+    if not isinstance(db, dict):
+        raise ValueError("invalid database")
+    for login, user in db.items():
+        if not isinstance(login, str) or not LOGIN_RE.fullmatch(login):
+            raise ValueError("invalid login")
+        if not isinstance(user, dict):
+            raise ValueError("invalid user")
+        if not isinstance(user.get("profile"), dict):
+            raise ValueError("invalid profile")
+        if not isinstance(user.get("password"), dict):
+            raise ValueError("invalid password record")
+        for field in ("failed", "lock_count", "locked_until"):
+            if _safe_int(user.get(field, 0), -1) < 0:
+                raise ValueError("invalid account state")
+        _params_for(user["password"])
+        for record in answer_records(user).values():
+            _params_for(record)
+    return db
+
+
+def load_db() -> dict:
+    if not DB_FILE.exists():
+        return {}
+    try:
+        with DB_FILE.open("r", encoding="utf-8") as file:
+            return _validate_db(json.load(file))
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
+        raise OSError("Помилка читання бази даних") from error
+
+
+def save_db(db: dict) -> None:
+    _validate_db(db)
+    fd, temp_name = tempfile.mkstemp(dir=BASE_DIR, prefix=".users_db_", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(db, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temp_path, DB_FILE)
+                break
+            except PermissionError as error:
+                if attempt == 4:
+                    raise OSError("Не вдалося замінити базу даних") from error
+                time.sleep(0.05)
+        if os.name != "nt":
+            directory_fd = os.open(BASE_DIR, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+@contextmanager
+def db_lock(timeout: float = 10.0):
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    if os.fstat(fd).st_size == 0:
+        os.write(fd, b"\0")
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise OSError("База даних зайнята іншим процесом")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def valid_name(name: str) -> bool:
+    if not 1 <= len(name) <= 50 or not any(char.isalpha() for char in name):
+        return False
+    apostrophes = "'’ʼ"
+    separators = "-" + apostrophes
+    for part in name.split(" "):
+        if not part or part[0] in separators or part[-1] in separators:
+            return False
+        if not all(char.isalpha() or char in separators for char in part):
+            return False
+        if any(first in separators and second in separators for first, second in zip(part, part[1:])):
+            return False
+    return True
+
+
+def format_name(name: str) -> str:
+    return " ".join(
+        "-".join(piece[:1].upper() + piece[1:].lower() for piece in part.split("-"))
+        for part in name.split()
+    )
+
+
+def ask_name() -> str:
+    while True:
+        name = input("Ім'я: ").strip()
+        if valid_name(name):
+            return format_name(name)
+        print("Ім'я: лише літери, дефіс і апостроф (до 50 символів)")
+
+
+def ask_age() -> int:
+    while True:
+        raw = input("Вік (1-120): ").strip()
+        if raw.isascii() and raw.isdecimal() and len(raw) <= 3 and 1 <= int(raw) <= 120:
+            return int(raw)
+        print("Введіть ціле число від 1 до 120")
+
+
+def ask_login() -> str:
+    while True:
+        login = input("Логін (3-32 символи: a-z, 0-9, _): ").strip().lower()
+        if LOGIN_RE.fullmatch(login):
+            return login
+        print("Некоректний формат логіна")
+
+
+def _load_common_passwords() -> set[str]:
+    passwords = COMMON_PASSWORDS.copy()
+    path = Path(__file__).resolve().parent / "common_passwords.txt"
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            for line in file:
+                password = line.strip().casefold()
+                if password and not password.startswith("#"):
+                    passwords.add(password)
+    except OSError:
+        pass
+    return passwords
+
+
+def ask_new_password(login: str, answers: list[str]) -> str:
+    common_passwords = _load_common_passwords()
+    while True:
+        password = normalize_password(
+            secure_getpass(f"Пароль (мін. {MIN_PASSWORD_LEN} символів): ")
+        )
+        folded_password = password.casefold()
+        if len(password) < MIN_PASSWORD_LEN:
+            print(f"Пароль закороткий (мін {MIN_PASSWORD_LEN})")
+        elif folded_password in common_passwords:
+            print("Оберіть менш поширений пароль")
+        elif len(login) >= 3 and login in folded_password:
+            print("Пароль не повинен містити логін")
+        elif len(set(folded_password)) < 5:
+            print("Пароль має містити щонайменше 5 різних символів")
+        elif normalize_secret(password) in answers:
+            print("Пароль не повинен збігатися з відповіддю на секретне питання")
+        elif normalize_password(secure_getpass("Повторіть пароль: ")) != password:
+            print("Паролі не збігаються")
+        else:
+            return password
+
+
+def ask_answer(
+    question: str,
+    confirm: bool = False,
+    minimum_length: int = 1,
+    previous_answers: list[str] | None = None,
+) -> str:
+    while True:
+        answer = normalize_secret(secure_getpass(f"{question} "))
+        if not answer:
+            print("Відповідь не може бути порожньою.")
+        elif len(answer) < minimum_length:
+            print("Відповідь має містити щонайменше 3 символи.")
+        elif previous_answers is not None and answer in previous_answers:
+            print("Відповіді на секретні питання мають бути різними.")
+        elif confirm and normalize_secret(secure_getpass("Повторіть відповідь: ")) != answer:
+            print("Відповіді не збігаються.")
+        else:
+            return answer
+
+
+def register() -> None:
+    print("\n РЕЄСТРАЦІЯ")
+    name = ask_name()
+    age = ask_age()
+    login = ask_login()
+    print("\n Відповіді на питання (вводяться приховано):")
+    answers = []
+    for _, question in QUESTIONS:
+        answers.append(
+            ask_answer(
+                question,
+                confirm=True,
+                minimum_length=3,
+                previous_answers=answers,
+            )
+        )
+    password = ask_new_password(login, answers)
+    new_user = {
+        "profile": {"name": name, "age": age},
+        "password": make_record(password),
+        "answers": [
+            {"question_id": question_id, "record": make_record(answer)}
+            for (question_id, _), answer in zip(QUESTIONS, answers)
+        ],
+        "failed": 0,
+        "lock_count": 0,
+        "locked_until": 0,
+    }
+    created = False
+    try:
+        with db_lock():
+            db = load_db()
+            if login not in db and len(db) < MAX_USERS:
+                db[login] = new_user
+                save_db(db)
+                created = True
+    except OSError:
+        created = False
+    if created:
+        print("Реєстрацію завершено успішно!")
+    else:
+        print("Не вдалося створити обліковий запис. Спробуйте інший логін")
+
+
+def reserve_attempt(login: str) -> tuple[bool, dict | None]:
+    with db_lock():
+        db = load_db()
+        user = db.get(login)
+        if not isinstance(user, dict):
+            return False, None
+        snapshot = copy.deepcopy(user)
+        now = time.time()
+        locked_until = _safe_int(user.get("locked_until"))
+        if locked_until != 0 and now - locked_until > 24 * 3600:
+            user["lock_count"] = 0
+        if locked_until > now:
+            return False, snapshot
+        user["failed"] = _safe_int(user.get("failed")) + 1
+        if user["failed"] >= MAX_ATTEMPTS:
+            user["lock_count"] = _safe_int(user.get("lock_count")) + 1
+            seconds = BASE_LOCK_SECONDS * 2 ** (user["lock_count"] - 1)
+            user["failed"] = 0
+            user["locked_until"] = int(now) + min(seconds, 24 * 3600)
+        save_db(db)
+        return True, snapshot
+
+
+def reset_failures(login: str) -> None:
+    with db_lock():
+        db = load_db()
+        user = db.get(login)
+        if isinstance(user, dict):
+            user.update({"failed": 0, "lock_count": 0, "locked_until": 0})
+            save_db(db)
+
+
+def _rehash_records(login: str, password: str, answers: dict[str, str]) -> None:
+    with db_lock():
+        db = load_db()
+        user = db.get(login)
+        if not isinstance(user, dict):
+            raise OSError("Обліковий запис не знайдено")
+        user["password"] = make_record(password)
+        user["answers"] = [
+            {"question_id": question_id, "record": make_record(answers[question_id])}
+            for question_id, _ in QUESTIONS
+        ]
+        save_db(db)
+
+
+def login_flow() -> None:
+    print("\n=== ВХІД ===")
+    started = time.monotonic()
+
+    def finish(message: str | None = None) -> None:
+        time.sleep(max(0.0, MIN_LOGIN_SECONDS - (time.monotonic() - started)))
+        if message:
+            print(message)
+
+    try:
+        login = input("Логін: ").strip().lower()
+        password = normalize_password(secure_getpass("Пароль: "))
+        supplied = {question_id: ask_answer(question) for question_id, question in QUESTIONS}
+        allowed, user = reserve_attempt(login)
+        records = answer_records(user)
+        ok = check_record(password, user.get("password") if user else _DUMMY_RECORD)
+        for question_id, _ in QUESTIONS:
+            ok &= check_record(supplied[question_id], records.get(question_id, _DUMMY_RECORD))
+        ok = bool(ok and allowed and user is not None)
+    except (OSError, ValueError):
+        finish(GENERIC_FAIL)
+        return
+
+    if not ok:
+        finish(GENERIC_FAIL)
+        return
+
+    needs_rehash = _needs_rehash(user["password"]) or any(
+        _needs_rehash(records.get(question_id, _DUMMY_RECORD))
+        for question_id, _ in QUESTIONS
+    )
+
+    try:
+        reset_failures(login)
+    except OSError:
+        finish(GENERIC_FAIL)
+        return
+
+    if needs_rehash:
+        try:
+            _rehash_records(login, password, supplied)
+        except OSError:
+            pass
+
+    finish()
+    profile = user.get("profile", {})
+    print("\n Автентифікація успішна!")
+    print(f"Ім'я: {profile.get('name', '—')}")
+    print(f"Вік:  {profile.get('age', '—')}")
+
+
+def main() -> None:
+    init_storage()
+    while True:
+        print("\n МЕНЮ\n1. Реєстрація\n2. Вхід\n0. Вихід")
+        choice = input("Ваш вибір: ").strip()
+        try:
+            if choice == "1":
+                register()
+            elif choice == "2":
+                login_flow()
+            elif choice == "0":
+                print("До побачення")
+                return
+            else:
+                print("Невідома команда.")
+        except (KeyboardInterrupt, EOFError):
+            print("\n Операцію скасовано.")
+        except RuntimeError as error:
+            print(f"Операцію скасовано: {error}")
+
+
+if __name__ == "__main__":
+    main()
